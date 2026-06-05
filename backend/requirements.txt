@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+python-dotenv
+chromadb
+sentence-transformers
+google-generativeai
+python-multipart
+pypdf
+argon2-cffi
+pyjwt
+argon2-cffi
+pyjwt[crypto]
