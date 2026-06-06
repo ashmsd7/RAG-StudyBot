@@ -65,11 +65,6 @@ npm install
 
 npm run dev
 ```
-
-ENV FILE :
-GEMINI_API_KEY=your_api_key_here
-JWT_SECRET_KEY=your_secret_key
-
 ### Author
 
 Ashwin, AI&DS Student From CBIT Hyderabad
