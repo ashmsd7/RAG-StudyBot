@@ -2,6 +2,7 @@
 import os
 import uuid
 import datetime
+import logging
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -18,6 +19,8 @@ import models
 import schemas
 import auth
 
+logger = logging.getLogger(__name__)
+
 Base.metadata.create_all(bind=auth_engine, tables=[models.User.__table__])
 Base.metadata.create_all(
     bind=study_engine,
@@ -29,12 +32,24 @@ Base.metadata.create_all(
     ],
 )
 
-# Ensure the existing chunks table has the new page_number column when upgrading older DBs.
-with study_engine.begin() as conn:
-    result = conn.execute(text("PRAGMA table_info(chunks)"))
-    columns = [row[1] for row in result.fetchall()]
-    if "page_number" not in columns:
-        conn.execute(text("ALTER TABLE chunks ADD COLUMN page_number INTEGER DEFAULT 1"))
+def migrate_chunks_table() -> None:
+    """Add columns that older SQLite study DBs may be missing."""
+    with study_engine.begin() as conn:
+        result = conn.execute(text("PRAGMA table_info(chunks)"))
+        columns = {row[1] for row in result.fetchall()}
+        required_columns = {
+            "page_number": "ALTER TABLE chunks ADD COLUMN page_number INTEGER DEFAULT 1",
+            "is_tagged": "ALTER TABLE chunks ADD COLUMN is_tagged BOOLEAN DEFAULT 0",
+            "document_title": "ALTER TABLE chunks ADD COLUMN document_title TEXT DEFAULT ''",
+        }
+
+        for column_name, statement in required_columns.items():
+            if column_name not in columns:
+                logger.info("Migrating chunks table: adding %s", column_name)
+                conn.execute(text(statement))
+
+
+migrate_chunks_table()
 
 app = FastAPI(title="Adaptive AI Study Coach API")
 
@@ -86,6 +101,7 @@ async def upload_document(
                 concept=c_data["concept"],
                 parent_concept=c_data["parent_concept"],
                 difficulty=c_data["difficulty"],
+                is_tagged=c_data.get("is_tagged", False),
                 page_number=c_data.get("page_number", 1),
                 document_title=c_data.get("document_title", file.filename),
             )
@@ -99,6 +115,7 @@ async def upload_document(
                         "difficulty": c_data["difficulty"],
                         "page_number": c_data.get("page_number", 1),
                         "document_title": c_data.get("document_title", file.filename),
+                        "is_tagged": c_data.get("is_tagged", False),
                     }
                 ],
                 ids=[c_data["chunk_id"]],
@@ -236,12 +253,23 @@ def get_quiz(
     import orchestrator
 
     quiz_data = orchestrator.generate_quiz_question(
+        current_user.id,
         request.concept,
         mastery,
         db,
         strict_mode=request.strict_mode,
     )
     return quiz_data
+
+@app.post("/summary", response_model=schemas.SummaryResponse)
+def get_summary(
+    request: schemas.SummaryRequest,
+    current_user: auth.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_study_db),
+):
+    import orchestrator
+
+    return orchestrator.generate_concept_summary(current_user.id, request.concept, db)
 
 @app.post("/evaluate", response_model=schemas.AnswerEvaluationResponse)
 def evaluate_answer(
@@ -274,6 +302,7 @@ def evaluate_answer(
     import orchestrator
 
     eval_data = orchestrator.evaluate_answer(
+        current_user.id,
         request.concept,
         request.question,
         request.answer,

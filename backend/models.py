@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Text, ForeignKey, JSON
+from sqlalchemy import Column, Integer, String, Float, Text, ForeignKey, JSON, Boolean
 from database import Base
 
 class User(Base):
@@ -22,6 +22,7 @@ class Chunk(Base):
     concept = Column(String)
     parent_concept = Column(String)
     difficulty = Column(String)
+    is_tagged = Column(Boolean, default=False)
     page_number = Column(Integer, default=1)
     document_title = Column(String)
 

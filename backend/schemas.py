@@ -13,10 +13,18 @@ class QuizRequest(BaseModel):
     concept: str
     strict_mode: Optional[bool] = True
 
+class SummaryRequest(BaseModel):
+    concept: str
+
 class QuestionResponse(BaseModel):
     question: str
     hints: List[str]
     difficulty: str
+    source_chunks: Optional[List[SourceChunk]] = None
+
+class SummaryResponse(BaseModel):
+    summary: str
+    key_points: List[str]
     source_chunks: Optional[List[SourceChunk]] = None
 
 class AnswerEvaluationRequest(BaseModel):
@@ -31,6 +39,7 @@ class AnswerEvaluationResponse(BaseModel):
     feedback: str
     new_mastery_score: float
     mistake_logged: Optional[str] = None
+    source_chunks: Optional[List[SourceChunk]] = None
 
 GmailEmail = Annotated[EmailStr, Field(pattern=r"^[^@\s]+@gmail\.com$")]
 
