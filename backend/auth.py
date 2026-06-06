@@ -6,9 +6,8 @@ from argon2 import PasswordHasher
 from fastapi import Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 from models import User
-from database import get_db
+from database import get_auth_db
 
-# Load secret key from env (fallback to placeholder)
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "changeme_secret_key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
@@ -35,10 +34,18 @@ def create_access_token(data: dict, expires_delta: Optional[datetime.timedelta] 
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+def _get_token_from_request(request: Request) -> str:
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        return auth_header.split("Bearer ", 1)[1].strip()
     token = request.cookies.get("access_token")
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing authentication token")
+    if token:
+        return token
+    raise HTTPException(status_code=401, detail="Missing authentication token")
+
+
+def get_current_user(request: Request, db: Session = Depends(get_auth_db)) -> User:
+    token = _get_token_from_request(request)
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
@@ -53,10 +60,18 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+
 def set_access_token(response: Response, user_id: str):
     token = create_access_token({"sub": user_id})
-    # HttpOnly cookie, secure flag omitted for local dev
-    response.set_cookie(key="access_token", value=token, httponly=True, max_age=ACCESS_TOKEN_EXPIRE_MINUTES*60, path="/", domain="localhost", samesite="none", secure=False)
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+        samesite="none",
+        secure=False,
+    )
 
 def clear_access_token(response: Response):
     response.delete_cookie(key="access_token", path="/")

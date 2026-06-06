@@ -9,6 +9,4 @@ google-generativeai
 python-multipart
 pypdf
 argon2-cffi
-pyjwt
-argon2-cffi
 pyjwt[crypto]

@@ -1,5 +1,7 @@
-from pydantic import BaseModel
-from typing import List, Optional
+from __future__ import annotations
+import re
+from typing import Annotated, List, Optional
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 class SourceChunk(BaseModel):
     chunk_id: str
@@ -7,7 +9,7 @@ class SourceChunk(BaseModel):
     page_number: int
 
 class QuizRequest(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None
     concept: str
     strict_mode: Optional[bool] = True
 
@@ -18,7 +20,7 @@ class QuestionResponse(BaseModel):
     source_chunks: Optional[List[SourceChunk]] = None
 
 class AnswerEvaluationRequest(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None
     concept: str
     question: str
     answer: str
@@ -30,10 +32,23 @@ class AnswerEvaluationResponse(BaseModel):
     new_mastery_score: float
     mistake_logged: Optional[str] = None
 
+GmailEmail = Annotated[EmailStr, Field(pattern=r"^[^@\s]+@gmail\.com$")]
+
+SPECIAL_CHAR_REGEX = re.compile(r"[!@#$%^&*()_+\-=[\]{}; '\\:\"|,.<>\/?]")
+
 class SignupRequest(BaseModel):
-    email: str
+    email: GmailEmail
     password: str
 
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        if not SPECIAL_CHAR_REGEX.search(value):
+            raise ValueError("Password must include at least one special character")
+        return value
+
 class LoginRequest(BaseModel):
-    email: str
+    email: GmailEmail
     password: str

@@ -1,0 +1,10 @@
+{
+  "name": "rag-studybot-root",
+  "private": true,
+  "scripts": {
+    "dev": "cd frontend && npm run dev",
+    "frontend": "cd frontend && npm run dev",
+    "backend": "cd backend && python -m uvicorn app:app --reload --host 127.0.0.1 --port 8000",
+    "dev:all": "start.bat"
+  }
+}
