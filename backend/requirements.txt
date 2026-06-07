@@ -10,3 +10,5 @@ python-multipart
 pypdf
 argon2-cffi
 pyjwt[crypto]
+pytest
+httpx

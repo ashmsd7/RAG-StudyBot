@@ -1,11 +1,13 @@
 import os
 import json
 import logging
+import datetime
 from typing import List, Optional, Dict, Tuple
 import random
 from sqlalchemy.orm import Session
 from database import get_user_vector_collection
 from gemini_client import generate_content_with_limit
+import models
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,8 @@ SIMILARITY_THRESHOLD = float(os.environ.get("RAG_SIMILARITY_THRESHOLD", "1.2"))
 MAX_RETRIEVE_CHUNKS = int(os.environ.get("RAG_MAX_RETRIEVE_CHUNKS", "6"))
 MAX_CONTEXT_CHUNKS = int(os.environ.get("RAG_MAX_CONTEXT_CHUNKS", "4"))
 CHAT_MAX_MESSAGE_CHARS = int(os.environ.get("CHAT_MAX_MESSAGE_CHARS", "1200"))
+CHAT_MAX_SESSION_MESSAGES = int(os.environ.get("CHAT_MAX_SESSION_MESSAGES", "25"))
+RECENT_QUESTION_LIMIT = int(os.environ.get("RECENT_QUESTION_LIMIT", "6"))
 
 QUIZ_DIFFICULTY_LEVELS = {
     "easy": {
@@ -52,6 +56,114 @@ def _normalize_quiz_difficulty(value: Optional[str], mastery: float) -> str:
     if mastery_level == "advanced":
         return "medium"
     return "easy"
+
+
+def _can_use_db(db: Session) -> bool:
+    return hasattr(db, "query") and hasattr(db, "commit")
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _chat_usage_for_user(user_id: str, db: Optional[Session] = None) -> Dict[str, int]:
+    used = 0
+    if db is not None and _can_use_db(db):
+        row = db.query(models.ChatUsage).filter(models.ChatUsage.user_id == user_id).first()
+        if row:
+            used = int(row.used_count or 0)
+
+    remaining = max(CHAT_MAX_SESSION_MESSAGES - used, 0)
+    return {
+        "max_message_chars": CHAT_MAX_MESSAGE_CHARS,
+        "max_context_chunks": MAX_CONTEXT_CHUNKS,
+        "max_chat_requests": CHAT_MAX_SESSION_MESSAGES,
+        "remaining_chat_requests": remaining,
+    }
+
+
+def _increment_chat_usage(user_id: str, db: Session) -> Dict[str, int]:
+    if not _can_use_db(db):
+        return _chat_usage_for_user(user_id, db)
+
+    row = db.query(models.ChatUsage).filter(models.ChatUsage.user_id == user_id).first()
+    if not row:
+        row = models.ChatUsage(user_id=user_id, used_count=0, updated_at=_now_iso())
+        db.add(row)
+
+    row.used_count = int(row.used_count or 0) + 1
+    row.updated_at = _now_iso()
+    db.commit()
+    return _chat_usage_for_user(user_id, db)
+
+
+def _get_recent_question_ids(db: Session, user_id: str, concept: str, difficulty: str) -> List[str]:
+    if not _can_use_db(db):
+        return []
+
+    row = (
+        db.query(models.RecentQuizHistory)
+        .filter(
+            models.RecentQuizHistory.user_id == user_id,
+            models.RecentQuizHistory.concept == concept.strip().lower(),
+            models.RecentQuizHistory.difficulty == difficulty,
+        )
+        .first()
+    )
+    if not row or not isinstance(row.question_ids, list):
+        return []
+    return [str(question_id) for question_id in row.question_ids if question_id]
+
+
+def _save_recent_question_ids(
+    db: Session,
+    user_id: str,
+    concept: str,
+    difficulty: str,
+    question_ids: List[str],
+) -> None:
+    if not _can_use_db(db):
+        return
+
+    normalized_concept = concept.strip().lower()
+    row = (
+        db.query(models.RecentQuizHistory)
+        .filter(
+            models.RecentQuizHistory.user_id == user_id,
+            models.RecentQuizHistory.concept == normalized_concept,
+            models.RecentQuizHistory.difficulty == difficulty,
+        )
+        .first()
+    )
+    if not row:
+        row = models.RecentQuizHistory(
+            user_id=user_id,
+            concept=normalized_concept,
+            difficulty=difficulty,
+            question_ids=[],
+            updated_at=_now_iso(),
+        )
+        db.add(row)
+
+    row.question_ids = question_ids[-RECENT_QUESTION_LIMIT:]
+    row.updated_at = _now_iso()
+    db.commit()
+
+
+def _remember_question(
+    db: Session,
+    user_id: str,
+    concept: str,
+    difficulty: str,
+    question_id: Optional[str],
+) -> None:
+    if not question_id:
+        return
+    recent = _get_recent_question_ids(db, user_id, concept, difficulty)
+    if question_id in recent:
+        recent.remove(question_id)
+    recent.append(question_id)
+    _save_recent_question_ids(db, user_id, concept, difficulty, recent)
 
 
 def _clean_json_payload(text: str) -> str:
@@ -108,6 +220,78 @@ def _source_chunks_from_results(
     return source_chunks
 
 
+def _tokenize_query(text: str) -> List[str]:
+    return [
+        token
+        for token in "".join(char.lower() if char.isalnum() else " " for char in text).split()
+        if len(token) >= 3
+    ]
+
+
+def _retrieve_chunks_from_sqlite(
+    user_id: str,
+    query_texts: List[str],
+    db: Session,
+    max_chunks: int = MAX_CONTEXT_CHUNKS,
+) -> Tuple[str, List[dict], List[dict]]:
+    if not _can_use_db(db):
+        return "", [], []
+
+    query_text = " ".join(query_texts).strip()
+    query_terms = set(_tokenize_query(query_text))
+    rows = (
+        db.query(models.Chunk)
+        .join(models.Document, models.Chunk.document_id == models.Document.id)
+        .filter(models.Document.user_id == user_id)
+        .all()
+    )
+    if not rows:
+        return "", [], []
+
+    scored_rows = []
+    for row in rows:
+        concept = (row.concept or "").lower()
+        parent_concept = (row.parent_concept or "").lower()
+        text = row.text or ""
+        haystack = f"{concept} {parent_concept} {text}".lower()
+        score = sum(3 if term in concept else 1 for term in query_terms if term in haystack)
+        if query_text and query_text.lower() in haystack:
+            score += 5
+        scored_rows.append((score, row))
+
+    scored_rows.sort(key=lambda item: item[0], reverse=True)
+    selected_rows = [row for score, row in scored_rows if score > 0][:max_chunks]
+    if not selected_rows:
+        selected_rows = [row for _, row in scored_rows[:max_chunks]]
+
+    selected_chunks = []
+    source_chunks = []
+    context_parts = []
+    for row in selected_rows:
+        metadata = {
+            "document_title": row.document_title or "Unknown",
+            "page_number": int(row.page_number or 1),
+            "concept": row.concept or "",
+            "difficulty": row.difficulty or "medium",
+        }
+        selected_chunks.append({
+            "chunk_id": row.id,
+            "text": row.text or "",
+            "metadata": metadata,
+            "best_distance": 0.0,
+        })
+        source_chunks.append({
+            "chunk_id": row.id,
+            "document_title": metadata["document_title"],
+            "page_number": metadata["page_number"],
+        })
+        context_parts.append(
+            f"[Source: {metadata['document_title']}, page {metadata['page_number']}]\n{row.text or ''}"
+        )
+
+    return "\n\n---\n\n".join(context_parts), source_chunks, selected_chunks
+
+
 def _retrieve_and_rerank(
     user_id: str,
     query_texts: List[str],
@@ -122,17 +306,21 @@ def _retrieve_and_rerank(
     This is the core grounding layer — it ensures ONLY high-quality,
     relevant chunks are passed to the LLM.
     """
-    collection = get_user_vector_collection(user_id)
+    try:
+        collection = get_user_vector_collection(user_id)
 
-    # Query ChromaDB with a larger pool for re-ranking
-    results = collection.query(
-        query_texts=query_texts,
-        n_results=max_chunks,
-        include=["documents", "metadatas", "distances"],
-    )
+        # Query ChromaDB with a larger pool for re-ranking
+        results = collection.query(
+            query_texts=query_texts,
+            n_results=max_chunks,
+            include=["documents", "metadatas", "distances"],
+        )
+    except Exception as exc:
+        logger.warning("Chroma retrieval failed for user=%s query=%s: %s", user_id, query_texts, exc)
+        return _retrieve_chunks_from_sqlite(user_id, query_texts, db, max_chunks=MAX_CONTEXT_CHUNKS)
 
     if not results or not results.get("ids"):
-        return "", [], []
+        return _retrieve_chunks_from_sqlite(user_id, query_texts, db, max_chunks=MAX_CONTEXT_CHUNKS)
 
     ids_list = results.get("ids", [[]])
     docs_list = results.get("documents", [[]])
@@ -193,7 +381,7 @@ def _retrieve_and_rerank(
             })
 
         if not fallback_items:
-            return "", [], []
+            return _retrieve_chunks_from_sqlite(user_id, query_texts, db, max_chunks=MAX_CONTEXT_CHUNKS)
 
         selected = fallback_items
     else:
@@ -262,6 +450,40 @@ def _fallback_question(
     }
 
 
+def _compact_context_preview(context: str, max_chars: int = 700) -> str:
+    clean = " ".join(context.split())
+    return clean[:max_chars].strip()
+
+
+def _fallback_summary_from_context(context: str, concept: str) -> Tuple[str, List[str]]:
+    preview = _compact_context_preview(context, 650)
+    if not preview:
+        return "No relevant uploaded material was found for this concept.", []
+
+    summary = (
+        f"Your uploaded material connects {concept} to this section: {preview}"
+        if concept
+        else f"Your uploaded material says: {preview}"
+    )
+    sentences = [
+        sentence.strip()
+        for sentence in preview.replace("?", ".").replace("!", ".").split(".")
+        if len(sentence.strip()) > 30
+    ]
+    key_points = sentences[:3]
+    return summary, key_points
+
+
+def _score_answer_against_context(answer: str, context: str) -> float:
+    answer_terms = set(_tokenize_query(answer))
+    context_terms = set(_tokenize_query(context))
+    if not answer_terms or not context_terms:
+        return 0.0
+    matched = answer_terms.intersection(context_terms)
+    coverage = len(matched) / max(len(answer_terms), 1)
+    return max(0.0, min(1.0, coverage))
+
+
 def generate_concept_summary(user_id: str, concept: str, db: Session) -> dict:
     # Use the new retrieval pipeline
     context, source_chunks, _ = _retrieve_and_rerank(
@@ -320,9 +542,10 @@ Output JSON strictly in this exact shape:
         }
     except Exception as e:
         logger.warning("Error in generate_concept_summary for user=%s concept=%s: %s", user_id, concept, e)
+        summary, key_points = _fallback_summary_from_context(context, concept)
         return {
-            "summary": "Unable to generate a summary from the uploaded material right now.",
-            "key_points": [],
+            "summary": summary,
+            "key_points": key_points,
             "source_chunks": source_chunks,
         }
 
@@ -335,15 +558,20 @@ def generate_grounded_chat_response(
 ) -> dict:
     clean_message = (message or "").strip()
     clean_concept = (concept or "").strip()
+    usage_limits = _chat_usage_for_user(user_id, db)
 
     if not clean_message:
         return {
             "answer": "Please enter a question about your uploaded study material.",
             "source_chunks": [],
-            "usage_limits": {
-                "max_message_chars": CHAT_MAX_MESSAGE_CHARS,
-                "max_context_chunks": MAX_CONTEXT_CHUNKS,
-            },
+            "usage_limits": usage_limits,
+        }
+
+    if usage_limits["remaining_chat_requests"] <= 0:
+        return {
+            "answer": "You have used the available chat turns for this session. Start a fresh server session or continue with quizzes and summaries.",
+            "source_chunks": [],
+            "usage_limits": usage_limits,
         }
 
     if len(clean_message) > CHAT_MAX_MESSAGE_CHARS:
@@ -359,10 +587,7 @@ def generate_grounded_chat_response(
         db=db,
     )
 
-    usage_limits = {
-        "max_message_chars": CHAT_MAX_MESSAGE_CHARS,
-        "max_context_chunks": MAX_CONTEXT_CHUNKS,
-    }
+    usage_limits = _increment_chat_usage(user_id, db)
 
     if not context:
         return {
@@ -457,7 +682,6 @@ def generate_quiz_question(
             "No quality chunks retrieved for quiz user=%s concept=%s strict_mode=%s",
             user_id, concept, strict_mode,
         )
-        return _fallback_question(level)
         return _fallback_question(level, concept=concept)
 
     # Prefer a single random chunk as the focus for each generated question to
@@ -465,7 +689,16 @@ def generate_quiz_question(
     primary_chunk = None
     question_id = None
     if isinstance(selected, list) and len(selected) > 0:
-        primary_chunk = random.choice(selected)
+        recent_ids = set(_get_recent_question_ids(db, user_id, concept, level))
+        unseen_chunks = [
+            item for item in selected
+            if item.get("chunk_id") not in recent_ids
+        ]
+        if not unseen_chunks:
+            _save_recent_question_ids(db, user_id, concept, level, [])
+            unseen_chunks = selected
+
+        primary_chunk = random.choice(unseen_chunks)
         primary_meta = primary_chunk.get("metadata", {}) if primary_chunk else {}
         doc_title = primary_meta.get("document_title", "Unknown")
         page = int(primary_meta.get("page_number", 1) or 1)
@@ -523,6 +756,7 @@ Output JSON strictly in this format:
         ):
             return _fallback_question(level, source_chunks, concept=concept, has_context=bool(source_chunks))
 
+        _remember_question(db, user_id, concept, level, question_id)
         return {
             "question": question_text,
             "hints": _normalize_hints(data.get("hints") or data.get("hint")),
@@ -532,7 +766,7 @@ Output JSON strictly in this format:
         }
     except Exception as e:
         logger.warning("Error in generate_quiz_question for user=%s concept=%s: %s", user_id, concept, e)
-        return _fallback_question(level, source_chunks)
+        return _fallback_question(level, source_chunks, concept=concept, has_context=bool(source_chunks))
 
 
 def evaluate_answer(
@@ -562,6 +796,7 @@ def evaluate_answer(
         return {
             "is_correct": False,
             "feedback": "This information is not available in the uploaded material. No relevant document chunks were found to evaluate your answer against.",
+            "correctness_score": 0.0,
             "mistake_logged": "Insufficient context — no matching material found",
             "new_mastery_score": current_mastery,
             "source_chunks": [],
@@ -576,10 +811,16 @@ STRICT RULES:
 1. Use ONLY the provided uploaded material context to evaluate the answer.
 2. Do NOT use external knowledge or your training data.
 3. Do NOT infer correctness from general knowledge — the answer must align with the uploaded context.
-4. If the student's answer introduces information NOT in the context, mark it as incorrect.
-5. If the context does not contain enough information to evaluate, mark as incorrect and explain.
-6. Be encouraging in feedback but STRICT about factual accuracy against the context.
-7. For the "mistake_logged" field: provide a concise 1-sentence description of what was wrong (or null if fully correct).
+4. Give partial credit when the student's answer captures the main idea but misses details.
+5. If the student's answer introduces information NOT in the context, lower the score for that part.
+6. If the context does not contain enough information to evaluate, score 0 and explain.
+7. Be encouraging in feedback but STRICT about factual accuracy against the context.
+8. For "correctness_score": use a number from 0.0 to 1.0.
+   - 1.0 = fully correct and complete
+   - 0.6-0.8 = mostly correct, missing smaller details
+   - 0.3-0.5 = partially correct, important gaps
+   - 0.0-0.2 = mostly incorrect or unsupported
+9. For the "mistake_logged" field: provide a concise 1-sentence description of what was missing/wrong (or null if fully correct).
 
 Uploaded Material Context:
 {context}
@@ -593,6 +834,7 @@ Evaluation Task:
 Output JSON strictly in this format:
 {{
     "is_correct": true or false,
+    "correctness_score": 0.0,
     "feedback": "Your encouraging feedback here. Explain what was right/wrong based ONLY on the uploaded material.",
     "mistake_logged": "short description of mistake or null if correct"
 }}
@@ -608,7 +850,12 @@ Output JSON strictly in this format:
         clean_text = _clean_json_payload(getattr(response, "text", ""))
         data = json.loads(clean_text)
 
-        is_correct = bool(data.get("is_correct"))
+        try:
+            correctness_score = float(data.get("correctness_score", 1.0 if data.get("is_correct") else 0.0))
+        except (TypeError, ValueError):
+            correctness_score = 1.0 if data.get("is_correct") else 0.0
+        correctness_score = max(0.0, min(1.0, correctness_score))
+        is_correct = correctness_score >= 0.75
 
         # --- Post-hoc validation: ensure feedback references the context ---
         feedback = str(data.get("feedback") or "").strip()
@@ -620,10 +867,14 @@ Output JSON strictly in this format:
             )
 
         # Calculate new mastery
-        if is_correct:
+        if correctness_score >= 0.75:
             new_mastery = min(1.0, current_mastery + 0.15)
+        elif correctness_score >= 0.4:
+            new_mastery = min(1.0, current_mastery + 0.07)
+        elif correctness_score > 0:
+            new_mastery = min(1.0, current_mastery + 0.03)
         else:
-            new_mastery = max(0.0, current_mastery - 0.05)
+            new_mastery = max(0.0, current_mastery - 0.03)
 
         mistake = data.get("mistake_logged")
         if mistake is not None:
@@ -634,6 +885,7 @@ Output JSON strictly in this format:
         return {
             "is_correct": is_correct,
             "feedback": feedback,
+            "correctness_score": correctness_score,
             "mistake_logged": mistake,
             "new_mastery_score": new_mastery,
             "source_chunks": source_chunks,
@@ -641,10 +893,24 @@ Output JSON strictly in this format:
 
     except Exception as e:
         logger.error("Error in evaluate_answer for user=%s concept=%s: %s", user_id, concept, e)
+        correctness_score = _score_answer_against_context(answer, context)
+        if correctness_score >= 0.75:
+            new_mastery = min(1.0, current_mastery + 0.15)
+        elif correctness_score >= 0.4:
+            new_mastery = min(1.0, current_mastery + 0.07)
+        elif correctness_score > 0:
+            new_mastery = min(1.0, current_mastery + 0.03)
+        else:
+            new_mastery = max(0.0, current_mastery - 0.03)
+
         return {
-            "is_correct": False,
-            "feedback": "Unable to evaluate your answer against the uploaded material due to a processing error. Please try again.",
-            "mistake_logged": "Evaluation processing error",
-            "new_mastery_score": current_mastery,
+            "is_correct": correctness_score >= 0.75,
+            "feedback": (
+                "I could not get the model evaluation, so I compared your answer with the retrieved source text. "
+                f"Your answer appears to match about {(correctness_score * 100):.0f}% of the key wording from the uploaded material."
+            ),
+            "correctness_score": correctness_score,
+            "mistake_logged": "Model evaluation fallback used",
+            "new_mastery_score": new_mastery,
             "source_chunks": source_chunks if source_chunks else [],
         }

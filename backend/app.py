@@ -28,6 +28,8 @@ Base.metadata.create_all(
         models.Document.__table__,
         models.Chunk.__table__,
         models.StudentState.__table__,
+        models.ChatUsage.__table__,
+        models.RecentQuizHistory.__table__,
         models.ApiUsage.__table__,
     ],
 )

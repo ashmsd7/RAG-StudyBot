@@ -35,6 +35,22 @@ class StudentState(Base):
     attempts = Column(Integer, default=0)
     mistakes = Column(JSON, default=list)
 
+class ChatUsage(Base):
+    __tablename__ = "chat_usage"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, unique=True, index=True, nullable=False)
+    used_count = Column(Integer, default=0)
+    updated_at = Column(String)
+
+class RecentQuizHistory(Base):
+    __tablename__ = "recent_quiz_history"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
+    concept = Column(String, index=True, nullable=False)
+    difficulty = Column(String, index=True, nullable=False)
+    question_ids = Column(JSON, default=list)
+    updated_at = Column(String)
+
 class ApiUsage(Base):
     __tablename__ = "api_usage"
     id = Column(Integer, primary_key=True, index=True)
@@ -45,4 +61,3 @@ class ApiUsage(Base):
     completion_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
     status = Column(String, default="success")
-

@@ -20,6 +20,8 @@ class SummaryRequest(BaseModel):
 class ChatUsageLimits(BaseModel):
     max_message_chars: int
     max_context_chunks: int
+    max_chat_requests: int
+    remaining_chat_requests: int
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=1200)
@@ -53,6 +55,7 @@ class AnswerEvaluationResponse(BaseModel):
     is_correct: bool
     feedback: str
     new_mastery_score: float
+    correctness_score: Optional[float] = None
     mistake_logged: Optional[str] = None
     source_chunks: Optional[List[SourceChunk]] = None
 
