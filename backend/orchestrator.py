@@ -1,12 +1,36 @@
 import os
 import json
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
+import random
 from sqlalchemy.orm import Session
 from database import get_user_vector_collection
 from gemini_client import generate_content_with_limit
 
 logger = logging.getLogger(__name__)
+
+# --- Configurable thresholds ---
+# Similarity threshold: ChromaDB uses L2 distance by default (lower = more similar).
+# These defaults work well with the default sentence-transformers embedding model.
+SIMILARITY_THRESHOLD = float(os.environ.get("RAG_SIMILARITY_THRESHOLD", "1.2"))
+MAX_RETRIEVE_CHUNKS = int(os.environ.get("RAG_MAX_RETRIEVE_CHUNKS", "6"))
+MAX_CONTEXT_CHUNKS = int(os.environ.get("RAG_MAX_CONTEXT_CHUNKS", "4"))
+CHAT_MAX_MESSAGE_CHARS = int(os.environ.get("CHAT_MAX_MESSAGE_CHARS", "1200"))
+
+QUIZ_DIFFICULTY_LEVELS = {
+    "easy": {
+        "level": "easy",
+        "instruction": "Ask one simple recall or definition question. The answer should be a short phrase or 1-2 sentences from the context.",
+    },
+    "medium": {
+        "level": "medium",
+        "instruction": "Ask one understanding question about how two details in the context connect. Avoid multi-step reasoning.",
+    },
+    "hard": {
+        "level": "hard",
+        "instruction": "Ask one deeper analysis question, but keep it answerable from the context and avoid obscure wording.",
+    },
+}
 
 
 def evaluate_mastery(mastery: float) -> str:
@@ -16,6 +40,18 @@ def evaluate_mastery(mastery: float) -> str:
         return "intermediate"
     else:
         return "advanced"
+
+
+def _normalize_quiz_difficulty(value: Optional[str], mastery: float) -> str:
+    if value:
+        normalized = value.strip().lower()
+        if normalized in QUIZ_DIFFICULTY_LEVELS:
+            return normalized
+
+    mastery_level = evaluate_mastery(mastery)
+    if mastery_level == "advanced":
+        return "medium"
+    return "easy"
 
 
 def _clean_json_payload(text: str) -> str:
@@ -44,26 +80,182 @@ def _normalize_hints(value) -> List[str]:
     return []
 
 
-def _source_chunks_from_results(results) -> List[dict]:
+def _source_chunks_from_results(
+    results, chunk_texts: Optional[List[str]] = None
+) -> List[dict]:
+    """Build source chunk metadata from ChromaDB query results."""
     source_chunks = []
     if not results or not results.get("ids"):
         return source_chunks
 
     ids = results.get("ids", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+    metadatas = (
+        results.get("metadatas", [[]])[0]
+        if results.get("metadatas")
+        else []
+    )
     for idx, cid in enumerate(ids):
         meta = metadatas[idx] if idx < len(metadatas) and metadatas[idx] else {}
-        source_chunks.append({
+        entry = {
             "chunk_id": cid,
             "document_title": meta.get("document_title", "Unknown"),
             "page_number": int(meta.get("page_number", 1) or 1),
-        })
+        }
+        # Include a preview of the chunk text if available (for debugging/audit)
+        if chunk_texts and idx < len(chunk_texts):
+            entry["preview"] = chunk_texts[idx][:200]
+        source_chunks.append(entry)
     return source_chunks
 
 
-def _fallback_question(level: str, source_chunks: Optional[List[dict]] = None) -> dict:
+def _retrieve_and_rerank(
+    user_id: str,
+    query_texts: List[str],
+    db: Session,
+    max_chunks: int = MAX_RETRIEVE_CHUNKS,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+) -> Tuple[str, List[dict], List[dict]]:
+    """
+    Retrieve chunks from ChromaDB, filter by similarity threshold, deduplicate,
+    and re-rank by relevance. Returns (context_string, source_chunks, selected_chunks).
+    
+    This is the core grounding layer — it ensures ONLY high-quality,
+    relevant chunks are passed to the LLM.
+    """
+    collection = get_user_vector_collection(user_id)
+
+    # Query ChromaDB with a larger pool for re-ranking
+    results = collection.query(
+        query_texts=query_texts,
+        n_results=max_chunks,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    if not results or not results.get("ids"):
+        return "", [], []
+
+    ids_list = results.get("ids", [[]])
+    docs_list = results.get("documents", [[]])
+    meta_list = results.get("metadatas", [[]])
+    dist_list = results.get("distances", [[]])
+
+    # Collect all candidate chunks across query texts with their distances
+    candidates: Dict[str, Dict] = {}
+
+    for q_idx in range(len(query_texts)):
+        if q_idx >= len(ids_list):
+            continue
+        ids = ids_list[q_idx]
+        docs = docs_list[q_idx] if q_idx < len(docs_list) else []
+        metas = meta_list[q_idx] if q_idx < len(meta_list) else []
+        dists = dist_list[q_idx] if q_idx < len(dist_list) else []
+
+        for c_idx, cid in enumerate(ids):
+            distance = dists[c_idx] if c_idx < len(dists) else float("inf")
+
+            # --- Similarity Threshold Filter ---
+            # Skip chunks that are too far (not semantically similar enough)
+            if distance > similarity_threshold:
+                continue
+
+            if cid not in candidates:
+                candidates[cid] = {
+                    "chunk_id": cid,
+                    "text": docs[c_idx] if c_idx < len(docs) else "",
+                    "metadata": metas[c_idx] if c_idx < len(metas) else {},
+                    "best_distance": distance,
+                }
+            else:
+                # Keep the best (lowest) distance across queries
+                if distance < candidates[cid]["best_distance"]:
+                    candidates[cid]["best_distance"] = distance
+
+    if not candidates:
+        logger.warning(
+            "Similarity threshold filtered out all results for user=%s query=%s. Falling back to top-ranked chunks.",
+            user_id,
+            query_texts,
+        )
+        # Fall back to the first query's results if available, even if they are outside the threshold.
+        fallback_ids = ids_list[0] if ids_list else []
+        fallback_docs = docs_list[0] if docs_list else []
+        fallback_metas = meta_list[0] if meta_list else []
+        fallback_dists = dist_list[0] if dist_list else []
+        fallback_items = []
+        for c_idx, cid in enumerate(fallback_ids):
+            if c_idx >= MAX_CONTEXT_CHUNKS:
+                break
+            fallback_items.append({
+                "chunk_id": cid,
+                "text": fallback_docs[c_idx] if c_idx < len(fallback_docs) else "",
+                "metadata": fallback_metas[c_idx] if c_idx < len(fallback_metas) else {},
+                "best_distance": fallback_dists[c_idx] if c_idx < len(fallback_dists) else float("inf"),
+            })
+
+        if not fallback_items:
+            return "", [], []
+
+        selected = fallback_items
+    else:
+        # --- Re-ranking: Sort by best distance (most relevant first) ---
+        sorted_candidates = sorted(candidates.values(), key=lambda x: x["best_distance"])
+        # Take top N after re-ranking
+        selected = sorted_candidates[:MAX_CONTEXT_CHUNKS]
+
+    # Build context string
+    context_parts = []
+    for item in selected:
+        meta = item["metadata"]
+        doc_title = meta.get("document_title", "Unknown")
+        page = meta.get("page_number", "?")
+        context_parts.append(
+            f"[Source: {doc_title}, page {page}]\n{item['text']}"
+        )
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    # Build source chunk references for citation
+    source_chunks = [
+        {
+            "chunk_id": item["chunk_id"],
+            "document_title": item["metadata"].get("document_title", "Unknown"),
+            "page_number": int(item["metadata"].get("page_number", 1) or 1),
+        }
+        for item in selected
+    ]
+
+    logger.info(
+        "Retrieved %d chunks for user=%s, filtered to %d quality chunks after re-ranking",
+        sum(len(ids) for ids in ids_list),
+        user_id,
+        len(selected),
+    )
+
+    return context, source_chunks, selected
+
+
+def _fallback_question(
+    level: str,
+    source_chunks: Optional[List[dict]] = None,
+    concept: str = "this topic",
+    has_context: bool = False,
+) -> dict:
+    if has_context:
+        if level == "hard":
+            question = f"Using the uploaded material, explain why {concept} matters in this section."
+        elif level == "medium":
+            question = f"According to the uploaded material, what are the main details connected to {concept}?"
+        else:
+            question = f"In your own words, what does the uploaded material say about {concept}?"
+        return {
+            "question": question,
+            "hints": ["Use only the cited source pages shown below."],
+            "difficulty": level,
+            "source_chunks": source_chunks or [],
+        }
+
     return {
-        "question": "Insufficient information found in uploaded material.",
+        "question": "Insufficient information found in uploaded material to generate a question on this topic.",
         "hints": ["Try selecting a concept that appears directly in your uploaded document."],
         "difficulty": level,
         "source_chunks": source_chunks or [],
@@ -71,37 +263,32 @@ def _fallback_question(level: str, source_chunks: Optional[List[dict]] = None) -
 
 
 def generate_concept_summary(user_id: str, concept: str, db: Session) -> dict:
-    collection = get_user_vector_collection(user_id)
-    results = collection.query(
+    # Use the new retrieval pipeline
+    context, source_chunks, _ = _retrieve_and_rerank(
+        user_id,
         query_texts=[concept],
-        n_results=3,
+        db=db,
     )
 
-    has_chunks = (
-        results
-        and results.get("documents")
-        and len(results["documents"]) > 0
-        and len(results["documents"][0]) > 0
-    )
-
-    if not has_chunks:
+    if not context:
         return {
             "summary": "No relevant uploaded material was found for this concept.",
             "key_points": [],
             "source_chunks": [],
         }
 
-    context = "\n".join(results["documents"][0])
-    source_chunks = _source_chunks_from_results(results)
     prompt = f"""
 SYSTEM:
-Explain the requested concept using ONLY the uploaded material context.
-Do not use outside knowledge. Keep the explanation short and grounded.
+You are a document-grounded study assistant. Explain the requested concept using ONLY the provided uploaded material context.
+Rules:
+- Use ONLY the uploaded material context below. Do NOT use outside knowledge.
+- If the context does not contain enough information about the concept, say so explicitly.
+- Keep the explanation concise, clear, and grounded in the source material.
+- Cite page numbers naturally if helpful.
 
-Concept:
-{concept}
+Concept: {concept}
 
-Context:
+Uploaded Material Context:
 {context}
 
 Output JSON strictly in this exact shape:
@@ -140,170 +327,324 @@ Output JSON strictly in this exact shape:
         }
 
 
-def generate_quiz_question(user_id: str, concept: str, mastery: float, db: Session, strict_mode: bool = True):
-    level = evaluate_mastery(mastery)
-    collection = get_user_vector_collection(user_id)
-    
-    # 1. Retrieve chunks (3-5 chunks max)
-    results = collection.query(
-        query_texts=[concept],
-        n_results=3
-    )
-    
-    # 2. Retrieval Validation Layer
-    has_chunks = (
-        results 
-        and results.get("documents") 
-        and len(results["documents"]) > 0 
-        and len(results["documents"][0]) > 0
-    )
-    
-    if not has_chunks:
-        if strict_mode:
-            return _fallback_question(level)
-        context = ""
-    else:
-        context = "\n".join(results["documents"][0])
-        
-    # Extract citation sources
-    source_chunks = _source_chunks_from_results(results) if has_chunks else []
+def generate_grounded_chat_response(
+    user_id: str,
+    message: str,
+    db: Session,
+    concept: Optional[str] = None,
+) -> dict:
+    clean_message = (message or "").strip()
+    clean_concept = (concept or "").strip()
 
-    # 3. Grounded Quiz Generation Prompt
+    if not clean_message:
+        return {
+            "answer": "Please enter a question about your uploaded study material.",
+            "source_chunks": [],
+            "usage_limits": {
+                "max_message_chars": CHAT_MAX_MESSAGE_CHARS,
+                "max_context_chunks": MAX_CONTEXT_CHUNKS,
+            },
+        }
+
+    if len(clean_message) > CHAT_MAX_MESSAGE_CHARS:
+        clean_message = clean_message[:CHAT_MAX_MESSAGE_CHARS]
+
+    query_texts = [clean_message]
+    if clean_concept:
+        query_texts.append(clean_concept)
+
+    context, source_chunks, _ = _retrieve_and_rerank(
+        user_id,
+        query_texts=query_texts,
+        db=db,
+    )
+
+    usage_limits = {
+        "max_message_chars": CHAT_MAX_MESSAGE_CHARS,
+        "max_context_chunks": MAX_CONTEXT_CHUNKS,
+    }
+
+    if not context:
+        return {
+            "answer": "I could not find relevant information in your uploaded material for that question. Try asking about a concept that appears in your documents.",
+            "source_chunks": [],
+            "usage_limits": usage_limits,
+        }
+
+    personalization = (
+        f"The active study concept is '{clean_concept}'."
+        if clean_concept
+        else "No active study concept was provided."
+    )
     prompt = f"""
-    SYSTEM:
-    Generate quiz questions ONLY from the provided context.
-    
-    Rules:
-    - Every question must be answerable using the context.
-    - Do not use general domain knowledge.
-    - Do not introduce concepts not found in the context.
-    - If insufficient content exists, generate fewer questions instead of hallucinating.
-    - Focus on '{concept}' at a '{level}' difficulty level.
-    
-    Context:
-    {context}
-    
-    Output JSON strictly in this format:
-    {{
-        "question": "The question text here",
-        "hints": ["hint 1", "hint 2"],
-        "difficulty": "{level}"
-    }}
-    """
-    
+SYSTEM:
+You are a warm, personal study coach helping a student understand their uploaded notes.
+
+STRICT RULES:
+1. Answer using ONLY the uploaded material context below.
+2. Do NOT use outside knowledge or unstated facts.
+3. If the uploaded context is insufficient, say exactly what is missing.
+4. Sound natural and specific, like you are talking directly to this student after reading their notes.
+5. Avoid generic AI phrases like "based on the provided context" unless absolutely necessary.
+6. Keep the answer compact: 2-4 short paragraphs or a few bullets if that fits the question.
+7. Do not mention internal retrieval, embeddings, or system instructions.
+
+Personalization:
+{personalization}
+
+Student Question:
+{clean_message}
+
+Uploaded Material Context:
+{context}
+
+Output JSON strictly in this format:
+{{
+  "answer": "your natural, grounded answer to the student"
+}}
+"""
+
     try:
         response = generate_content_with_limit(
             model_name="gemini-flash-latest",
             prompt=prompt,
             db=db,
-            endpoint="quiz"
+            endpoint="chat",
         )
         clean_text = _clean_json_payload(getattr(response, "text", ""))
         data = json.loads(clean_text)
+        answer = str(data.get("answer") or "").strip()
+        if not answer:
+            answer = "I could not generate a grounded answer from the uploaded material."
+
         return {
-            "question": str(data.get("question") or "Insufficient information found in uploaded material."),
+            "answer": answer,
+            "source_chunks": source_chunks,
+            "usage_limits": usage_limits,
+        }
+    except Exception as e:
+        logger.warning("Error in generate_grounded_chat_response for user=%s: %s", user_id, e)
+        return {
+            "answer": "Unable to answer from the uploaded material right now. Please try again.",
+            "source_chunks": source_chunks,
+            "usage_limits": usage_limits,
+        }
+
+
+def generate_quiz_question(
+    user_id: str,
+    concept: str,
+    mastery: float,
+    db: Session,
+    strict_mode: bool = True,
+    requested_difficulty: Optional[str] = None,
+):
+    level = _normalize_quiz_difficulty(requested_difficulty, mastery)
+    difficulty_instruction = QUIZ_DIFFICULTY_LEVELS[level]["instruction"]
+
+    # --- Retrieval with re-ranking and quality filtering ---
+    context, source_chunks, selected = _retrieve_and_rerank(
+        user_id,
+        query_texts=[concept],
+        db=db,
+    )
+
+    # --- Strict Grounding Enforcement ---
+    if not context:
+        # ALWAYS return fallback when no quality chunks found —
+        # regardless of strict_mode. The difference is in the message detail.
+        logger.warning(
+            "No quality chunks retrieved for quiz user=%s concept=%s strict_mode=%s",
+            user_id, concept, strict_mode,
+        )
+        return _fallback_question(level)
+        return _fallback_question(level, concept=concept)
+
+    # Prefer a single random chunk as the focus for each generated question to
+    # increase variety between successive quiz requests.
+    primary_chunk = None
+    question_id = None
+    if isinstance(selected, list) and len(selected) > 0:
+        primary_chunk = random.choice(selected)
+        primary_meta = primary_chunk.get("metadata", {}) if primary_chunk else {}
+        doc_title = primary_meta.get("document_title", "Unknown")
+        page = int(primary_meta.get("page_number", 1) or 1)
+        # Build a compact context focused on the chosen chunk
+        context = f"[Source: {doc_title}, page {page}]\n{primary_chunk.get('text', '')}"
+        question_id = primary_chunk.get("chunk_id")
+
+    # --- Grounded Quiz Generation Prompt ---
+    prompt = f"""
+SYSTEM:
+You are a document-grounded quiz coach. Generate a helpful practice question using ONLY the provided uploaded material context.
+
+STRICT RULES:
+1. Every question MUST be 100% answerable using ONLY the context below.
+2. Do NOT use any general domain knowledge not present in the context.
+3. Do NOT introduce concepts, facts, or terminology not found in the uploaded material.
+4. Since source context is available, prefer asking a smaller, simpler question about what is present instead of refusing.
+5. If the context truly cannot support any question about '{concept}', output a JSON with:
+   {{"question": "The uploaded material does not contain sufficient information about this topic.", "hints": [], "difficulty": "{level}"}}
+6. Target difficulty: {level}.
+7. Difficulty behavior: {difficulty_instruction}
+8. Use direct, student-friendly wording. Avoid trick questions and overly broad questions.
+
+Uploaded Material Context:
+{context}
+
+Output JSON strictly in this format:
+{{
+    "question": "The question text here",
+    "hints": ["hint 1", "hint 2"],
+    "difficulty": "{level}"
+}}
+"""
+
+    try:
+        response = generate_content_with_limit(
+            model_name="gemini-flash-latest",
+            prompt=prompt,
+            db=db,
+            endpoint="quiz",
+        )
+        clean_text = _clean_json_payload(getattr(response, "text", ""))
+        data = json.loads(clean_text)
+
+        question_text = str(data.get("question") or "").strip()
+
+        # --- Post-hoc grounding validation ---
+        # If the model returned an insufficient-context message, treat as fallback
+        if (
+            "does not contain" in question_text.lower()
+            or "insufficient" in question_text.lower()
+            or "no information" in question_text.lower()
+            or not question_text
+            or len(question_text) < 10
+        ):
+            return _fallback_question(level, source_chunks, concept=concept, has_context=bool(source_chunks))
+
+        return {
+            "question": question_text,
             "hints": _normalize_hints(data.get("hints") or data.get("hint")),
             "difficulty": str(data.get("difficulty") or level),
             "source_chunks": source_chunks,
+            "question_id": question_id,
         }
     except Exception as e:
         logger.warning("Error in generate_quiz_question for user=%s concept=%s: %s", user_id, concept, e)
         return _fallback_question(level, source_chunks)
 
+
 def evaluate_answer(
     user_id: str,
-    concept: str, 
-    question: str, 
-    answer: str, 
-    current_mastery: float, 
-    db: Session, 
-    strict_mode: bool = True
+    concept: str,
+    question: str,
+    answer: str,
+    current_mastery: float,
+    db: Session,
+    strict_mode: bool = True,
 ):
     level = evaluate_mastery(current_mastery)
-    collection = get_user_vector_collection(user_id)
-    
-    # 1. Retrieve chunks (3-5 chunks max)
-    results = collection.query(
-        query_texts=[question, concept],
-        n_results=3
-    )
-    
-    # 2. Retrieval Validation Layer
-    has_chunks = (
-        results 
-        and results.get("documents") 
-        and len(results["documents"]) > 0 
-        and len(results["documents"][0]) > 0
-    )
-    
-    if not has_chunks:
-        if strict_mode:
-            return {
-                "is_correct": False,
-                "feedback": "This information is not available in the uploaded material.",
-                "mistake_logged": "Insufficient context",
-                "new_mastery_score": current_mastery,
-                "source_chunks": []
-            }
-        context = ""
-    else:
-        context = "\n".join(results["documents"][0])
-        
-    # Extract citation sources
-    source_chunks = _source_chunks_from_results(results) if has_chunks else []
 
-    # 3. Grounded Prompting for Evaluation
+    # --- Retrieval with re-ranking — query by BOTH concept and question ---
+    context, source_chunks, selected = _retrieve_and_rerank(
+        user_id,
+        query_texts=[concept, question],
+        db=db,
+    )
+
+    # --- Strict Grounding Enforcement ---
+    if not context:
+        logger.warning(
+            "No quality chunks retrieved for evaluation user=%s concept=%s strict_mode=%s",
+            user_id, concept, strict_mode,
+        )
+        return {
+            "is_correct": False,
+            "feedback": "This information is not available in the uploaded material. No relevant document chunks were found to evaluate your answer against.",
+            "mistake_logged": "Insufficient context — no matching material found",
+            "new_mastery_score": current_mastery,
+            "source_chunks": [],
+        }
+
+    # --- Grounded Evaluation Prompt ---
     prompt = f"""
-    SYSTEM:
-    You are a document-grounded study assistant.
-    
-    Rules:
-    - Use ONLY the provided context.
-    - Do NOT use external knowledge.
-    - Do NOT infer concepts not explicitly mentioned.
-    - Do NOT generate questions or evaluations from outside the provided material.
-    - If the answer cannot be found in the context, reply that "This information is not available in the uploaded material." and mark as incorrect.
-    
-    Context:
-    {context}
-    
-    The student is answering a question about '{concept}'.
-    Question: {question}
-    Student Answer: {answer}
-    
-    Output JSON strictly in this format:
-    {{
-        "is_correct": true/false,
-        "feedback": "Your feedback here. Be encouraging.",
-        "mistake_logged": "short description of mistake" (or null if correct)
-    }}
-    """
-    
+SYSTEM:
+You are a document-grounded study assistant evaluating a student's answer.
+
+STRICT RULES:
+1. Use ONLY the provided uploaded material context to evaluate the answer.
+2. Do NOT use external knowledge or your training data.
+3. Do NOT infer correctness from general knowledge — the answer must align with the uploaded context.
+4. If the student's answer introduces information NOT in the context, mark it as incorrect.
+5. If the context does not contain enough information to evaluate, mark as incorrect and explain.
+6. Be encouraging in feedback but STRICT about factual accuracy against the context.
+7. For the "mistake_logged" field: provide a concise 1-sentence description of what was wrong (or null if fully correct).
+
+Uploaded Material Context:
+{context}
+
+Evaluation Task:
+- Concept: {concept}
+- Difficulty Level: {level}
+- Question: {question}
+- Student Answer: {answer}
+
+Output JSON strictly in this format:
+{{
+    "is_correct": true or false,
+    "feedback": "Your encouraging feedback here. Explain what was right/wrong based ONLY on the uploaded material.",
+    "mistake_logged": "short description of mistake or null if correct"
+}}
+"""
+
     try:
         response = generate_content_with_limit(
             model_name="gemini-flash-latest",
             prompt=prompt,
             db=db,
-            endpoint="evaluate"
+            endpoint="evaluate",
         )
         clean_text = _clean_json_payload(getattr(response, "text", ""))
         data = json.loads(clean_text)
-        
+
+        is_correct = bool(data.get("is_correct"))
+
+        # --- Post-hoc validation: ensure feedback references the context ---
+        feedback = str(data.get("feedback") or "").strip()
+        if not feedback or len(feedback) < 5:
+            feedback = (
+                "Your answer has been evaluated against the uploaded material. "
+                + ("It appears correct based on the source document." if is_correct
+                   else "It does not align with the information found in your uploaded material.")
+            )
+
         # Calculate new mastery
-        if data.get("is_correct"):
+        if is_correct:
             new_mastery = min(1.0, current_mastery + 0.15)
         else:
             new_mastery = max(0.0, current_mastery - 0.05)
-            
-        data["new_mastery_score"] = new_mastery
-        data["source_chunks"] = source_chunks
-        return data
+
+        mistake = data.get("mistake_logged")
+        if mistake is not None:
+            mistake = str(mistake).strip()
+            if mistake.lower() in ("null", "none", "", "n/a"):
+                mistake = None
+
+        return {
+            "is_correct": is_correct,
+            "feedback": feedback,
+            "mistake_logged": mistake,
+            "new_mastery_score": new_mastery,
+            "source_chunks": source_chunks,
+        }
+
     except Exception as e:
-        print(f"Error in evaluate_answer: {e}")
+        logger.error("Error in evaluate_answer for user=%s concept=%s: %s", user_id, concept, e)
         return {
             "is_correct": False,
-            "feedback": "This information is not available in the uploaded material.",
-            "mistake_logged": "Evaluation error",
+            "feedback": "Unable to evaluate your answer against the uploaded material due to a processing error. Please try again.",
+            "mistake_logged": "Evaluation processing error",
             "new_mastery_score": current_mastery,
-            "source_chunks": []
+            "source_chunks": source_chunks if source_chunks else [],
         }

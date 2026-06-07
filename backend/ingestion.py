@@ -17,7 +17,7 @@ ENABLE_CONCEPT_TAGGING = os.environ.get("ENABLE_CONCEPT_TAGGING", "true").lower(
 
 DEFAULT_CONCEPT_METADATA = {
     "concept": "unknown",
-    "parent_concept": None,
+    "parent_concept": "",
     "difficulty": "medium",
     "is_tagged": False,
 }
@@ -100,7 +100,7 @@ Chunks:
 
             results[index] = {
                 "concept": item.get("concept", "unknown") or "unknown",
-                "parent_concept": item.get("parent_concept"),
+                "parent_concept": item.get("parent_concept") or "",
                 "difficulty": item.get("difficulty", "medium") or "medium",
                 "is_tagged": True,
             }

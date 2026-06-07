@@ -94,16 +94,22 @@ async def upload_document(
         collection = get_user_vector_collection(current_user.id)
 
         for c_data in processed_chunks:
+            parent_concept = c_data.get("parent_concept") or ""
+            difficulty = c_data.get("difficulty") or "medium"
+            page_number = int(c_data.get("page_number", 1) or 1)
+            document_title = c_data.get("document_title") or file.filename
+            is_tagged = bool(c_data.get("is_tagged", False))
+
             c = models.Chunk(
                 id=c_data["chunk_id"],
                 document_id=doc_id,
                 text=c_data["text"],
                 concept=c_data["concept"],
-                parent_concept=c_data["parent_concept"],
-                difficulty=c_data["difficulty"],
-                is_tagged=c_data.get("is_tagged", False),
-                page_number=c_data.get("page_number", 1),
-                document_title=c_data.get("document_title", file.filename),
+                parent_concept=parent_concept,
+                difficulty=difficulty,
+                is_tagged=is_tagged,
+                page_number=page_number,
+                document_title=document_title,
             )
             db.add(c)
             collection.add(
@@ -111,11 +117,11 @@ async def upload_document(
                 metadatas=[
                     {
                         "concept": c_data["concept"],
-                        "parent_concept": c_data["parent_concept"],
-                        "difficulty": c_data["difficulty"],
-                        "page_number": c_data.get("page_number", 1),
-                        "document_title": c_data.get("document_title", file.filename),
-                        "is_tagged": c_data.get("is_tagged", False),
+                        "parent_concept": parent_concept,
+                        "difficulty": difficulty,
+                        "page_number": page_number,
+                        "document_title": document_title,
+                        "is_tagged": is_tagged,
                     }
                 ],
                 ids=[c_data["chunk_id"]],
@@ -252,14 +258,29 @@ def get_quiz(
 
     import orchestrator
 
-    quiz_data = orchestrator.generate_quiz_question(
-        current_user.id,
-        request.concept,
-        mastery,
-        db,
-        strict_mode=request.strict_mode,
-    )
-    return quiz_data
+    try:
+        quiz_data = orchestrator.generate_quiz_question(
+            current_user.id,
+            request.concept,
+            mastery,
+            db,
+            strict_mode=request.strict_mode,
+            requested_difficulty=request.difficulty,
+        )
+        # Ensure the response is a dict with the expected keys.
+        if not isinstance(quiz_data, dict) or "question" not in quiz_data:
+            raise ValueError("Invalid quiz payload returned from orchestrator")
+        return quiz_data
+    except Exception as e:
+        logger.exception("Quiz generation failed for user=%s concept=%s: %s", current_user.id, request.concept, e)
+        # Safe fallback response matching `schemas.QuestionResponse`
+        return {
+            "question": "Unable to generate a quiz question right now.",
+            "hints": [],
+            "difficulty": "novice",
+            "source_chunks": [],
+            "question_id": None,
+        }
 
 @app.post("/summary", response_model=schemas.SummaryResponse)
 def get_summary(
@@ -270,6 +291,21 @@ def get_summary(
     import orchestrator
 
     return orchestrator.generate_concept_summary(current_user.id, request.concept, db)
+
+@app.post("/chat", response_model=schemas.ChatResponse)
+def chat_with_documents(
+    request: schemas.ChatRequest,
+    current_user: auth.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_study_db),
+):
+    import orchestrator
+
+    return orchestrator.generate_grounded_chat_response(
+        current_user.id,
+        request.message,
+        db,
+        concept=request.concept,
+    )
 
 @app.post("/evaluate", response_model=schemas.AnswerEvaluationResponse)
 def evaluate_answer(

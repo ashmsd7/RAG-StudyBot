@@ -12,20 +12,35 @@ class QuizRequest(BaseModel):
     user_id: Optional[str] = None
     concept: str
     strict_mode: Optional[bool] = True
+    difficulty: Optional[str] = None
 
 class SummaryRequest(BaseModel):
     concept: str
+
+class ChatUsageLimits(BaseModel):
+    max_message_chars: int
+    max_context_chunks: int
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=1200)
+    concept: Optional[str] = None
 
 class QuestionResponse(BaseModel):
     question: str
     hints: List[str]
     difficulty: str
     source_chunks: Optional[List[SourceChunk]] = None
+    question_id: Optional[str] = None
 
 class SummaryResponse(BaseModel):
     summary: str
     key_points: List[str]
     source_chunks: Optional[List[SourceChunk]] = None
+
+class ChatResponse(BaseModel):
+    answer: str
+    source_chunks: Optional[List[SourceChunk]] = None
+    usage_limits: ChatUsageLimits
 
 class AnswerEvaluationRequest(BaseModel):
     user_id: Optional[str] = None
