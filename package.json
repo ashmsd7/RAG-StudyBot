@@ -6,5 +6,11 @@
     "frontend": "cd frontend && npm run dev",
     "backend": "cd backend && python -m uvicorn app:app --reload --host 127.0.0.1 --port 8000",
     "dev:all": "start.bat"
+  },
+  "dependencies": {
+    "react-force-graph": "^1.48.2",
+    "reactflow": "^11.11.4",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^6.0.1"
   }
 }

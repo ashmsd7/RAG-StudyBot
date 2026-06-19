@@ -7,6 +7,8 @@ class SourceChunk(BaseModel):
     chunk_id: str
     document_title: str
     page_number: int
+    document_id: Optional[str] = None
+    document_available: Optional[bool] = None
 
 class QuizRequest(BaseModel):
     user_id: Optional[str] = None
@@ -44,6 +46,9 @@ class ChatResponse(BaseModel):
     source_chunks: Optional[List[SourceChunk]] = None
     usage_limits: ChatUsageLimits
 
+class RecommendationsResponse(BaseModel):
+    weakest_concepts: List[str]
+
 class AnswerEvaluationRequest(BaseModel):
     user_id: Optional[str] = None
     concept: str
@@ -66,6 +71,7 @@ SPECIAL_CHAR_REGEX = re.compile(r"[!@#$%^&*()_+\-=[\]{}; '\\:\"|,.<>\/?]")
 class SignupRequest(BaseModel):
     email: GmailEmail
     password: str
+    username: Optional[str] = None
 
     @field_validator("password")
     @classmethod
@@ -76,6 +82,27 @@ class SignupRequest(BaseModel):
             raise ValueError("Password must include at least one special character")
         return value
 
+    @field_validator("username")
+    @classmethod
+    def validate_optional_username(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        cleaned = " ".join(value.strip().split())
+        if not cleaned:
+            raise ValueError("Username is required")
+        return cleaned[:32]
+
 class LoginRequest(BaseModel):
     email: GmailEmail
     password: str
+
+class ProfileUpdateRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=32)
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        cleaned = " ".join(value.strip().split())
+        if not cleaned:
+            raise ValueError("Username is required")
+        return cleaned

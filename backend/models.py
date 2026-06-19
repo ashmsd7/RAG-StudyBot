@@ -6,6 +6,7 @@ class User(Base):
     id = Column(String, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    username = Column(String, nullable=True)
 
 class Document(Base):
     __tablename__ = "documents"
@@ -13,6 +14,7 @@ class Document(Base):
     user_id = Column(String, index=True)
     title = Column(String)
     upload_date = Column(String)
+    file_path = Column(String, nullable=True)
 
 class Chunk(Base):
     __tablename__ = "chunks"

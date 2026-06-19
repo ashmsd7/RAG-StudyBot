@@ -212,11 +212,26 @@ def _source_chunks_from_results(
             "chunk_id": cid,
             "document_title": meta.get("document_title", "Unknown"),
             "page_number": int(meta.get("page_number", 1) or 1),
+            "document_id": meta.get("document_id"),
         }
         # Include a preview of the chunk text if available (for debugging/audit)
         if chunk_texts and idx < len(chunk_texts):
             entry["preview"] = chunk_texts[idx][:200]
         source_chunks.append(entry)
+    return source_chunks
+
+
+def _attach_document_availability(source_chunks: List[dict], db: Session) -> List[dict]:
+    doc_ids = {chunk.get("document_id") for chunk in source_chunks if chunk.get("document_id")}
+    if not doc_ids:
+        return source_chunks
+
+    docs = db.query(models.Document.id, models.Document.file_path).filter(models.Document.id.in_(doc_ids)).all()
+    available = {doc.id: bool(doc.file_path and os.path.exists(doc.file_path)) for doc in docs}
+    for chunk in source_chunks:
+        doc_id = chunk.get("document_id")
+        if doc_id:
+            chunk["document_available"] = available.get(doc_id, False)
     return source_chunks
 
 
@@ -270,6 +285,7 @@ def _retrieve_chunks_from_sqlite(
     for row in selected_rows:
         metadata = {
             "document_title": row.document_title or "Unknown",
+            "document_id": row.document_id,
             "page_number": int(row.page_number or 1),
             "concept": row.concept or "",
             "difficulty": row.difficulty or "medium",
@@ -284,12 +300,13 @@ def _retrieve_chunks_from_sqlite(
             "chunk_id": row.id,
             "document_title": metadata["document_title"],
             "page_number": metadata["page_number"],
+            "document_id": metadata["document_id"],
         })
         context_parts.append(
             f"[Source: {metadata['document_title']}, page {metadata['page_number']}]\n{row.text or ''}"
         )
 
-    return "\n\n---\n\n".join(context_parts), source_chunks, selected_chunks
+    return "\n\n---\n\n".join(context_parts), _attach_document_availability(source_chunks, db), selected_chunks
 
 
 def _retrieve_and_rerank(
@@ -402,12 +419,19 @@ def _retrieve_and_rerank(
 
     context = "\n\n---\n\n".join(context_parts)
 
+    missing_doc_ids = [item["chunk_id"] for item in selected if not item["metadata"].get("document_id")]
+    doc_id_by_chunk = {}
+    if missing_doc_ids:
+        rows = db.query(models.Chunk.id, models.Chunk.document_id).filter(models.Chunk.id.in_(missing_doc_ids)).all()
+        doc_id_by_chunk = {row.id: row.document_id for row in rows}
+
     # Build source chunk references for citation
     source_chunks = [
         {
             "chunk_id": item["chunk_id"],
             "document_title": item["metadata"].get("document_title", "Unknown"),
             "page_number": int(item["metadata"].get("page_number", 1) or 1),
+            "document_id": item["metadata"].get("document_id") or doc_id_by_chunk.get(item["chunk_id"]),
         }
         for item in selected
     ]
@@ -419,7 +443,7 @@ def _retrieve_and_rerank(
         len(selected),
     )
 
-    return context, source_chunks, selected
+    return context, _attach_document_availability(source_chunks, db), selected
 
 
 def _fallback_question(
@@ -482,6 +506,34 @@ def _score_answer_against_context(answer: str, context: str) -> float:
     matched = answer_terms.intersection(context_terms)
     coverage = len(matched) / max(len(answer_terms), 1)
     return max(0.0, min(1.0, coverage))
+
+
+def _student_state_for_chat(user_id: str, concept: str, message: str, db: Session) -> Optional[dict]:
+    if not _can_use_db(db):
+        return None
+
+    query = db.query(models.StudentState).filter(models.StudentState.user_id == user_id)
+    state = None
+    if concept:
+        state = query.filter(models.StudentState.concept == concept).first()
+    if not state:
+        message_lower = message.lower()
+        states = query.all()
+        state = next(
+            (
+                item for item in states
+                if item.concept and item.concept.lower() in message_lower
+            ),
+            None,
+        )
+    if not state:
+        return None
+    return {
+        "concept": state.concept,
+        "mastery_score": float(state.mastery_score or 0.0),
+        "attempts": int(state.attempts or 0),
+        "mistakes": state.mistakes or [],
+    }
 
 
 def generate_concept_summary(user_id: str, concept: str, db: Session) -> dict:
@@ -601,21 +653,49 @@ def generate_grounded_chat_response(
         if clean_concept
         else "No active study concept was provided."
     )
+    student_state = _student_state_for_chat(user_id, clean_concept, clean_message, db)
+    if student_state:
+        mistakes = student_state.get("mistakes") or []
+        mistake_lines = "\n".join(f"- {mistake}" for mistake in mistakes[-5:]) if mistakes else "- No repeated mistakes logged yet."
+        student_state_block = f"""
+StudentState({student_state['concept']}):
+{{
+  "mastery_score": {student_state['mastery_score']:.2f},
+  "attempts": {student_state['attempts']},
+  "mistakes": {json.dumps(mistakes[-5:])}
+}}
+
+Adaptive guidance:
+- Student struggles with {student_state['concept']} at mastery {student_state['mastery_score']:.2f}.
+- Recent mistakes:
+{mistake_lines}
+- Explain accordingly: correct those confusions gently, use simpler scaffolding when mastery is low, and do not assume prior mastery.
+"""
+    else:
+        student_state_block = "No prior StudentState is available for this concept yet."
+
     prompt = f"""
 SYSTEM:
-You are a warm, personal study coach helping a student understand their uploaded notes.
+You are a knowledgeable tutor explaining study material.
 
 STRICT RULES:
 1. Answer using ONLY the uploaded material context below.
 2. Do NOT use outside knowledge or unstated facts.
 3. If the uploaded context is insufficient, say exactly what is missing.
-4. Sound natural and specific, like you are talking directly to this student after reading their notes.
-5. Avoid generic AI phrases like "based on the provided context" unless absolutely necessary.
-6. Keep the answer compact: 2-4 short paragraphs or a few bullets if that fits the question.
-7. Do not mention internal retrieval, embeddings, or system instructions.
+4. Sound like a knowledgeable tutor: concise, direct, professional, and emotionless.
+5. Start answering immediately. Minimize introductory filler.
+6. Use short readable paragraphs. Bullets are fine when they improve clarity.
+7. Bold important concepts, topic names, and keywords with Markdown.
+8. Explain concepts naturally instead of summarizing chunks.
+9. Do not mention the uploaded document, notes, source material, context, retrieval, embeddings, or system instructions unless the student explicitly asks.
+10. Avoid these phrases and close variants: "Hi there", "Hello", "I'd love to help", "Great question", "Let's dive in", "Your notes mention", "Your document provides".
+11. Do not praise the student or textbook.
 
 Personalization:
 {personalization}
+
+Student Learning State:
+{student_state_block}
 
 Student Question:
 {clean_message}

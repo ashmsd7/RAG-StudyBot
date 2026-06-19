@@ -83,6 +83,13 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+def _quota_http_exception() -> HTTPException:
+    return HTTPException(
+        status_code=429,
+        detail="Gemini quota is exhausted right now. Try again later or switch to a Gemini API key/plan with available quota.",
+    )
+
+
 def _log_failed_usage(db: Session, endpoint: str, model_name: str, error_message: str) -> None:
     try:
         usage_log = models.ApiUsage(
@@ -195,6 +202,8 @@ def generate_content_with_limit(
                     len(prompt),
                     exc,
                 )
+            if _is_rate_limit_error(exc):
+                raise _quota_http_exception() from exc
             raise exc
 
     if last_exception:
@@ -207,4 +216,6 @@ def generate_content_with_limit(
                 len(prompt),
                 last_exception,
             )
+        if _is_rate_limit_error(last_exception):
+            raise _quota_http_exception() from last_exception
         raise last_exception

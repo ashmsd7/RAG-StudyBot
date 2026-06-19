@@ -131,6 +131,10 @@ def test_upload_chat_quiz_evaluate_summary_persistence_flow(client_and_db):
     assert summary.status_code == 200
     assert summary.json()["key_points"]
 
+    concepts = client.get("/concepts")
+    assert concepts.status_code == 200
+    assert concepts.json() == ["Search Algorithms"]
+
     quiz_one = client.post("/quiz", json={"concept": "Search Algorithms", "difficulty": "easy"})
     assert quiz_one.status_code == 200
     first_question_id = quiz_one.json()["question_id"]
@@ -170,3 +174,65 @@ def test_upload_chat_quiz_evaluate_summary_persistence_flow(client_and_db):
         assert state.mastery_score > 0
     finally:
         db.close()
+
+    recommendations = client.get("/recommendations")
+    assert recommendations.status_code == 200
+    assert recommendations.json()["weakest_concepts"] == ["Search Algorithms"]
+
+
+def test_ingestion_fallback_infers_topic_name(monkeypatch):
+    monkeypatch.setattr(
+        ingestion,
+        "generate_content_with_limit",
+        lambda *args, **kwargs: types.SimpleNamespace(text="not json"),
+    )
+
+    tags = ingestion.extract_concepts_from_chunks(
+        ["Informed search uses heuristic functions to choose efficient paths through a state space."],
+        db=types.SimpleNamespace(),
+    )
+
+    assert tags[0]["concept"]
+    assert tags[0]["concept"].lower() != "unknown"
+    assert tags[0]["parent_concept"] == "Uploaded Material"
+
+
+def test_chat_prompt_includes_student_state(client_and_db, monkeypatch):
+    client, SessionLocal = client_and_db
+    captured = {}
+
+    db = SessionLocal()
+    try:
+        db.add(models.Document(id="doc-1", user_id="test-user", title="notes.pdf", upload_date="now"))
+        db.add(models.Chunk(
+            id="chunk-mqtt",
+            document_id="doc-1",
+            text="MQTT is a lightweight publish subscribe protocol.",
+            concept="MQTT",
+            parent_concept="IoT Protocols",
+            difficulty="easy",
+            is_tagged=True,
+            page_number=1,
+            document_title="notes.pdf",
+        ))
+        db.add(models.StudentState(
+            user_id="test-user",
+            concept="MQTT",
+            mastery_score=0.25,
+            attempts=2,
+            mistakes=["confuses MQTT with HTTP"],
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    def capture_gemini(*args, **kwargs):
+        captured["prompt"] = kwargs.get("prompt", "")
+        return types.SimpleNamespace(text='{"answer": "MQTT is lightweight and publish subscribe."}')
+
+    monkeypatch.setattr(orchestrator, "generate_content_with_limit", capture_gemini)
+
+    response = client.post("/chat", json={"message": "Explain MQTT", "concept": "MQTT"})
+    assert response.status_code == 200
+    assert "StudentState(MQTT)" in captured["prompt"]
+    assert "confuses MQTT with HTTP" in captured["prompt"]
