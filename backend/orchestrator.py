@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 # Similarity threshold: ChromaDB uses L2 distance by default (lower = more similar).
 # These defaults work well with the default sentence-transformers embedding model.
 SIMILARITY_THRESHOLD = float(os.environ.get("RAG_SIMILARITY_THRESHOLD", "1.2"))
-MAX_RETRIEVE_CHUNKS = int(os.environ.get("RAG_MAX_RETRIEVE_CHUNKS", "6"))
-MAX_CONTEXT_CHUNKS = int(os.environ.get("RAG_MAX_CONTEXT_CHUNKS", "4"))
+MAX_RETRIEVE_CHUNKS = int(os.environ.get("RAG_MAX_RETRIEVE_CHUNKS", "15"))
+MAX_CONTEXT_CHUNKS = int(os.environ.get("RAG_MAX_CONTEXT_CHUNKS", "8"))
 CHAT_MAX_MESSAGE_CHARS = int(os.environ.get("CHAT_MAX_MESSAGE_CHARS", "1200"))
 CHAT_MAX_SESSION_MESSAGES = int(os.environ.get("CHAT_MAX_SESSION_MESSAGES", "25"))
-RECENT_QUESTION_LIMIT = int(os.environ.get("RECENT_QUESTION_LIMIT", "6"))
+RECENT_QUESTION_LIMIT = int(os.environ.get("RECENT_QUESTION_LIMIT", "12"))
 
 QUIZ_DIFFICULTY_LEVELS = {
     "easy": {
@@ -642,11 +642,59 @@ def generate_grounded_chat_response(
     usage_limits = _increment_chat_usage(user_id, db)
 
     if not context:
-        return {
-            "answer": "I could not find relevant information in your uploaded material for that question. Try asking about a concept that appears in your documents.",
-            "source_chunks": [],
-            "usage_limits": usage_limits,
-        }
+        # When no context is found, allow external source access
+        external_prompt = f"""
+SYSTEM:
+You are a knowledgeable tutor. The student's question is not covered in their uploaded study material.
+
+PERMISSION:
+You have permission to use your general knowledge and external sources to answer this question.
+
+REQUIREMENTS:
+1. Provide the best possible answer using your knowledge.
+2. If the question involves a numerical problem or algorithm:
+   - Present the question clearly and neatly
+   - Provide a step-by-step solved answer
+   - Show all calculations/logic clearly
+3. At the end, mention the source/link where this information can be verified
+4. Be concise, direct, and professional
+5. Use short readable paragraphs. Bullets are fine when they improve clarity
+6. Bold important concepts, topic names, and keywords with Markdown
+
+Student Question:
+{clean_message}
+
+Output JSON strictly in this format:
+{{
+  "answer": "your comprehensive answer with step-by-step solution if numerical, ending with source citation"
+}}
+"""
+
+        try:
+            response = generate_content_with_limit(
+                model_name="gemini-flash-latest",
+                prompt=external_prompt,
+                db=db,
+                endpoint="chat",
+            )
+            clean_text = _clean_json_payload(getattr(response, "text", ""))
+            data = json.loads(clean_text)
+            answer = str(data.get("answer") or "").strip()
+            if not answer:
+                answer = "I could not generate an answer for this question."
+
+            return {
+                "answer": answer,
+                "source_chunks": [],
+                "usage_limits": usage_limits,
+            }
+        except Exception as e:
+            logger.warning("Error in external chat response for user=%s: %s", user_id, e)
+            return {
+                "answer": "Unable to answer this question right now. Please try again.",
+                "source_chunks": [],
+                "usage_limits": usage_limits,
+            }
 
     personalization = (
         f"The active study concept is '{clean_concept}'."
@@ -775,7 +823,9 @@ def generate_quiz_question(
             if item.get("chunk_id") not in recent_ids
         ]
         if not unseen_chunks:
+            # All chunks have been used recently, clear history and shuffle
             _save_recent_question_ids(db, user_id, concept, level, [])
+            random.shuffle(selected)
             unseen_chunks = selected
 
         primary_chunk = random.choice(unseen_chunks)
@@ -784,7 +834,8 @@ def generate_quiz_question(
         page = int(primary_meta.get("page_number", 1) or 1)
         # Build a compact context focused on the chosen chunk
         context = f"[Source: {doc_title}, page {page}]\n{primary_chunk.get('text', '')}"
-        question_id = primary_chunk.get("chunk_id")
+        # Generate a unique question ID using chunk ID and timestamp to avoid collisions
+        question_id = f"{primary_chunk.get('chunk_id')}_{int(datetime.datetime.now().timestamp() * 1000)}"
 
     # --- Grounded Quiz Generation Prompt ---
     prompt = f"""
@@ -887,20 +938,23 @@ def evaluate_answer(
 SYSTEM:
 You are a document-grounded study assistant evaluating a student's answer.
 
-STRICT RULES:
-1. Use ONLY the provided uploaded material context to evaluate the answer.
-2. Do NOT use external knowledge or your training data.
-3. Do NOT infer correctness from general knowledge — the answer must align with the uploaded context.
-4. Give partial credit when the student's answer captures the main idea but misses details.
-5. If the student's answer introduces information NOT in the context, lower the score for that part.
-6. If the context does not contain enough information to evaluate, score 0 and explain.
-7. Be encouraging in feedback but STRICT about factual accuracy against the context.
-8. For "correctness_score": use a number from 0.0 to 1.0.
-   - 1.0 = fully correct and complete
-   - 0.6-0.8 = mostly correct, missing smaller details
-   - 0.3-0.5 = partially correct, important gaps
-   - 0.0-0.2 = mostly incorrect or unsupported
-9. For the "mistake_logged" field: provide a concise 1-sentence description of what was missing/wrong (or null if fully correct).
+EVALUATION PRINCIPLES:
+1. Focus on CONCEPTUAL UNDERSTANDING rather than exact wording or phrasing.
+2. Allow students to use their own lingo, wording, and examples to demonstrate understanding.
+3. Examples that illustrate the concept correctly should NOT be penalized, even if not from the source material.
+4. The core concepts and relationships must align with the uploaded material, but expression can vary.
+5. Give generous partial credit when the student demonstrates understanding of the main ideas.
+6. Only penalize if the answer contains FACTUAL ERRORS about the core concepts from the material.
+7. Be encouraging and recognize good understanding even with different wording/examples.
+
+SCORING GUIDELINES (correctness_score 0.0 to 1.0):
+- 0.9-1.0 = Excellent understanding, core concepts fully grasped (even with different examples/wording)
+- 0.7-0.9 = Good understanding, minor gaps or slightly different expression
+- 0.5-0.7 = Partial understanding, some key concepts missing or confused
+- 0.3-0.5 = Weak understanding, significant conceptual gaps
+- 0.0-0.3 = Little to no understanding of the core concepts
+
+For the "mistake_logged" field: provide a concise 1-sentence description of conceptual errors (or null if the core understanding is sound).
 
 Uploaded Material Context:
 {context}
@@ -915,8 +969,8 @@ Output JSON strictly in this format:
 {{
     "is_correct": true or false,
     "correctness_score": 0.0,
-    "feedback": "Your encouraging feedback here. Explain what was right/wrong based ONLY on the uploaded material.",
-    "mistake_logged": "short description of mistake or null if correct"
+    "feedback": "Your encouraging feedback here. Focus on whether they understand the core concepts, allowing for their own wording and examples.",
+    "mistake_logged": "short description of conceptual mistake or null if understanding is sound"
 }}
 """
 

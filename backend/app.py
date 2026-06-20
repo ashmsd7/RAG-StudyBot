@@ -520,7 +520,12 @@ def evaluate_answer(
         strict_mode=request.strict_mode,
     )
 
-    state.mastery_score = eval_data.get("new_mastery_score", current_mastery)
+    new_mastery = eval_data.get("new_mastery_score")
+    if new_mastery is not None and isinstance(new_mastery, (int, float)):
+        state.mastery_score = float(new_mastery)
+    else:
+        state.mastery_score = current_mastery
+    
     state.attempts += 1
 
     mistake = eval_data.get("mistake_logged")
@@ -529,7 +534,15 @@ def evaluate_answer(
         current_mistakes.append(mistake)
         state.mistakes = current_mistakes[:]
 
-    db.commit()
+    try:
+        db.commit()
+        db.refresh(state)
+    except Exception as e:
+        logger.error(f"Failed to update student state: {e}")
+        db.rollback()
+    
+    # Ensure the returned data has the updated mastery score
+    eval_data["new_mastery_score"] = state.mastery_score
     return eval_data
 
 @app.get("/api/usage")
