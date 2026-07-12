@@ -3,13 +3,13 @@ An AI-powered study platform that uses Retrieval-Augmented Generation (RAG) to a
 
 ## Features
 
-- 📄 PDF Upload & Processing
-- 🔍 Semantic Search using Vector Embeddings
-- 🤖 Context-Aware Question Answering
-- 📝 AI-Generated Quizzes
-- 📊 Student Mastery Tracking
-- 🎯 Adaptive Learning Based on Weak Areas
-- 🔐 User Authentication
+-  PDF Upload & Processing
+-  Semantic Search using Vector Embeddings
+-  Context-Aware Question Answering
+-  AI-Generated Quizzes
+-  Student Mastery Tracking
+-  Adaptive Learning Based on Weak Areas
+-  User Authentication
 
 ## Tech Stack
 
