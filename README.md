@@ -1,4 +1,3 @@
-# Hi, This is Codex - accessing your codebase.
 
 An AI-powered study platform that uses Retrieval-Augmented Generation (RAG) to answer questions from uploaded study material and provide personalized learning experiences.
 
